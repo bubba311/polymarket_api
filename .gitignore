@@ -1,0 +1,12 @@
+# Virtual environments
+.polymarket_api/
+.venv/
+venv/
+env/
+
+# Python cache/build
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
