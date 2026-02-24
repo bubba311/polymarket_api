@@ -1,0 +1,12 @@
+README.md
+pyproject.toml
+polymarket_api/__init__.py
+polymarket_api/client.py
+polymarket_api/live_orderbook.py
+polymarket_api.egg-info/PKG-INFO
+polymarket_api.egg-info/SOURCES.txt
+polymarket_api.egg-info/dependency_links.txt
+polymarket_api.egg-info/entry_points.txt
+polymarket_api.egg-info/requires.txt
+polymarket_api.egg-info/top_level.txt
+tests/test_client.py
