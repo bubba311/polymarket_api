@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import shutil
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
@@ -110,6 +111,19 @@ def _fmt_size(size: Any) -> str:
     return f"{int(s):,} contracts"
 
 
+def _size_bar(size: Decimal, max_size: Decimal, *, width: int = 18, style: str) -> Text:
+    if size <= 0 or max_size <= 0:
+        return Text("." * width, style="grey27")
+
+    filled = int((size * Decimal(width) / max_size).to_integral_value(rounding=ROUND_HALF_UP))
+    filled = max(1, min(width, filled))
+
+    bar = Text()
+    bar.append("#" * filled, style=style)
+    bar.append("." * (width - filled), style="grey27")
+    return bar
+
+
 def _iter_levels(levels: Any) -> list[dict[str, Any]]:
     if not isinstance(levels, list):
         return []
@@ -139,17 +153,28 @@ def _build_side_table(
     t = Table(show_header=False, box=None, padding=(0, 1), expand=True)
     t.add_column("price", justify="right", style="bold bright_red", no_wrap=True)
     t.add_column("size", justify="right", style="white", no_wrap=True)
+    t.add_column("bar", justify="left", no_wrap=True)
+
+    all_sizes = [size for _, size in asks] + [size for _, size in bids]
+    max_size = max(all_sizes) if all_sizes else Decimal("0")
 
     for price, size in asks:
         style = "bold bright_red" if best_ask is not None and price == best_ask else "red3"
-        t.add_row(f"[{style}]{_fmt_price_cents(price)}[/{style}]", f"[white]{_fmt_size(size)}[/white]")
+        t.add_row(
+            f"[{style}]{_fmt_price_cents(price)}[/{style}]",
+            f"[white]{_fmt_size(size)}[/white]",
+            _size_bar(size, max_size, style=style),
+        )
 
-    t.add_row("", "")
-    t.add_row(f"[bold cyan]-- {outcome.upper()} Bids --[/bold cyan]", "")
+    t.add_row(f"[bold cyan]-- {outcome.upper()} Bids --[/bold cyan]", "", "")
 
     for price, size in bids:
         style = "bold bright_green" if best_bid is not None and price == best_bid else "green3"
-        t.add_row(f"[{style}]{_fmt_price_cents(price)}[/{style}]", f"[white]{_fmt_size(size)}[/white]")
+        t.add_row(
+            f"[{style}]{_fmt_price_cents(price)}[/{style}]",
+            f"[white]{_fmt_size(size)}[/white]",
+            _size_bar(size, max_size, style=style),
+        )
 
     return t
 
@@ -161,7 +186,8 @@ def _build_outcome_panel(
     state: dict[str, Any],
     depth: int,
 ) -> Panel:
-    asks = _levels_asc(state["asks"], depth)
+    # Display asks from far-to-near so the levels closest to mid sit near the bids divider.
+    asks = list(reversed(_levels_asc(state["asks"], depth)))
     bids = _levels_desc(state["bids"], depth)
     best_bid: Decimal | None = state.get("best_bid")
     best_ask: Decimal | None = state.get("best_ask")
@@ -201,7 +227,8 @@ def _render_dashboard(
 ) -> Panel:
     header = Text()
     header.append(event_title + "\n", style="bold white")
-    header.append(market_question + "\n", style="grey82")
+    if market_question and market_question != event_title:
+        header.append(market_question + "\n", style="grey82")
     header.append(f"Updated {last_update_text}", style="grey58")
 
     ordered_tokens = sorted(token_to_outcome.items(), key=lambda kv: kv[1].lower())
@@ -269,6 +296,13 @@ def _timestamp_text(msg: dict[str, Any]) -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _fit_depth_to_terminal(requested_depth: int) -> int:
+    # Approximate available rows for both sides after headers/panel chrome.
+    rows = shutil.get_terminal_size((120, 40)).lines
+    max_per_side = max(4, (rows - 14) // 2)
+    return max(1, min(requested_depth, max_per_side))
+
+
 async def stream_market_orderbook(
     *,
     event_title: str,
@@ -289,60 +323,81 @@ async def stream_market_orderbook(
     }
     last_update_text = "waiting for feed..."
 
-    async with websockets.connect(MARKET_WSS, ping_interval=20, ping_timeout=20) as ws:
-        await ws.send(json.dumps(subscription))
+    with Live(
+        _render_dashboard(
+            event_title=event_title,
+            market_question=market_question,
+            last_update_text=last_update_text,
+            books=books,
+            token_to_outcome=token_to_outcome,
+            depth=depth,
+        ),
+        refresh_per_second=10,
+        screen=True,
+    ) as live:
+        reconnect_delay = 1.0
+        while True:
+            try:
+                async with websockets.connect(MARKET_WSS, ping_interval=20, ping_timeout=40) as ws:
+                    await ws.send(json.dumps(subscription))
+                    reconnect_delay = 1.0
 
-        with Live(
-            _render_dashboard(
-                event_title=event_title,
-                market_question=market_question,
-                last_update_text=last_update_text,
-                books=books,
-                token_to_outcome=token_to_outcome,
-                depth=depth,
-            ),
-            refresh_per_second=10,
-            screen=True,
-        ) as live:
-            while True:
-                raw = await ws.recv()
-                payload = json.loads(raw)
+                    while True:
+                        raw = await ws.recv()
+                        payload = json.loads(raw)
 
-                if isinstance(payload, list):
-                    items = [x for x in payload if isinstance(x, dict)]
-                elif isinstance(payload, dict):
-                    items = [payload]
-                else:
-                    continue
+                        if isinstance(payload, list):
+                            items = [x for x in payload if isinstance(x, dict)]
+                        elif isinstance(payload, dict):
+                            items = [payload]
+                        else:
+                            continue
 
-                changed = False
-                for msg in items:
-                    event_type = str(msg.get("event_type") or "")
+                        changed = False
+                        for msg in items:
+                            event_type = str(msg.get("event_type") or "")
 
-                    if event_type == "book" or ("asset_id" in msg and ("bids" in msg or "asks" in msg)):
-                        token_id = str(msg.get("asset_id") or "")
-                        if token_id in books:
-                            _apply_book_snapshot(books[token_id], msg)
-                            changed = True
+                            if event_type == "book" or ("asset_id" in msg and ("bids" in msg or "asks" in msg)):
+                                token_id = str(msg.get("asset_id") or "")
+                                if token_id in books:
+                                    _apply_book_snapshot(books[token_id], msg)
+                                    changed = True
 
-                    elif event_type == "price_change":
-                        if _apply_price_change(books, msg):
-                            changed = True
+                            elif event_type == "price_change":
+                                if _apply_price_change(books, msg):
+                                    changed = True
 
-                    if changed:
-                        last_update_text = _timestamp_text(msg)
+                            if changed:
+                                last_update_text = _timestamp_text(msg)
 
-                if changed:
-                    live.update(
-                        _render_dashboard(
-                            event_title=event_title,
-                            market_question=market_question,
-                            last_update_text=last_update_text,
-                            books=books,
-                            token_to_outcome=token_to_outcome,
-                            depth=depth,
-                        )
+                        if changed:
+                            live.update(
+                                _render_dashboard(
+                                    event_title=event_title,
+                                    market_question=market_question,
+                                    last_update_text=last_update_text,
+                                    books=books,
+                                    token_to_outcome=token_to_outcome,
+                                    depth=depth,
+                                )
+                            )
+            except (websockets.exceptions.ConnectionClosed, OSError, asyncio.TimeoutError) as exc:
+                now = datetime.now(timezone.utc).isoformat()
+                last_update_text = (
+                    f"feed disconnected ({exc}); reconnecting in {reconnect_delay:.1f}s at {now}"
+                )
+                live.update(
+                    _render_dashboard(
+                        event_title=event_title,
+                        market_question=market_question,
+                        last_update_text=last_update_text,
+                        books=books,
+                        token_to_outcome=token_to_outcome,
+                        depth=depth,
                     )
+                )
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(30.0, reconnect_delay * 2.0)
 
 
 def main() -> None:
@@ -362,7 +417,12 @@ def main() -> None:
         default=None,
         help="Optional exact market slug to select (useful for multi-market events).",
     )
-    parser.add_argument("--depth", type=int, default=8, help="Number of levels to display per side.")
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=16,
+        help="Max levels per side; auto-clamped to terminal height.",
+    )
     args = parser.parse_args()
 
     event_slug = _event_slug_from_url(args.event_url)
@@ -387,7 +447,7 @@ def main() -> None:
             market_question=str(market.get("question") or ""),
             token_ids=token_ids,
             token_to_outcome=token_to_outcome,
-            depth=max(1, args.depth),
+            depth=_fit_depth_to_terminal(max(1, args.depth)),
         )
     )
 
